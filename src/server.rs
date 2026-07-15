@@ -1,21 +1,40 @@
-use crate::allocation::{AllocationTable, ChannelTable, ServerStatsSnapshot};
+use crate::allocation::{AllocationTable, ChannelTable, ClientPacketSender, ServerStatsSnapshot};
 use crate::auth::AuthManager;
 use crate::message::{
     Attribute, ErrorCode, EventType, Message, MessageHeader, Method, encode_xor_address,
 };
+use crate::tls::ensure_rustls_crypto_provider;
 use bytes::{Buf, Bytes, BytesMut};
+use dtls::config::Config as DtlsConfig;
 use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock as TokioRwLock;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
+use webrtc_util::conn::{Conn, Listener};
 
 type HmacSha1 = Hmac<sha1::Sha1>;
+
+struct DtlsClientPacketSender {
+    conn: Arc<dyn Conn + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl ClientPacketSender for DtlsClientPacketSender {
+    async fn send_to_client(&self, data: &[u8], _client_addr: &SocketAddr) -> io::Result<usize> {
+        self.conn
+            .send(data)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+}
 
 /// Format bytes into human-readable string
 fn format_bytes(bytes: u64) -> String {
@@ -75,6 +94,8 @@ pub struct TurnServer {
     stats_dump_interval_secs: u64,
     stats_dump_skip_if_no_change: bool,
     server_name: String,
+    stun_enabled: bool,
+    turn_enabled: bool,
 }
 
 struct NonceEntry {
@@ -105,6 +126,11 @@ impl TurnServer {
 
     pub fn set_server_name(&mut self, server_name: String) {
         self.server_name = server_name;
+    }
+
+    pub fn set_protocol_enabled(&mut self, stun_enabled: bool, turn_enabled: bool) {
+        self.stun_enabled = stun_enabled;
+        self.turn_enabled = turn_enabled;
     }
 
     pub fn with_password(relay_addr: Ipv4Addr, realm: String, password: String) -> Self {
@@ -157,6 +183,8 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            stun_enabled: true,
+            turn_enabled: true,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -223,6 +251,8 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            stun_enabled: true,
+            turn_enabled: true,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -257,6 +287,8 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            stun_enabled: true,
+            turn_enabled: true,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -310,6 +342,8 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            stun_enabled: true,
+            turn_enabled: true,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -554,6 +588,112 @@ impl TurnServer {
         }
     }
 
+    pub async fn run_tls(
+        &self,
+        addr: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind(addr).await?;
+        let acceptor = TlsAcceptor::from(tls_config);
+        info!("TURN TLS server listening on {}", addr);
+
+        loop {
+            let (socket, peer_addr) = listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let server = self.clone();
+            tokio::spawn(async move {
+                let mut socket = match acceptor.accept(socket).await {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        error!("TLS handshake error from {}: {}", peer_addr, e);
+                        return;
+                    }
+                };
+
+                const MAX_TLS_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+                let mut buf = BytesMut::with_capacity(65536);
+                loop {
+                    buf.reserve(1024);
+
+                    if buf.capacity() > MAX_TLS_BUFFER_SIZE {
+                        error!("TLS buffer exceeded maximum size from {}", peer_addr);
+                        break;
+                    }
+
+                    match socket.read_buf(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_n) => {
+                            let data = buf.split().freeze();
+                            if let Some(response) =
+                                handle_tcp_message(&data, &server, peer_addr).await
+                                && socket.write_all(&response).await.is_err()
+                            {
+                                break;
+                            }
+                            if buf.is_empty() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("TLS read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    pub async fn run_dtls(
+        &self,
+        addr: SocketAddr,
+        dtls_config: DtlsConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        ensure_rustls_crypto_provider();
+        let listener = dtls::listener::listen(addr, dtls_config).await?;
+        info!("TURN DTLS server listening on {}", addr);
+
+        loop {
+            let (conn, peer_addr) = listener.accept().await?;
+            let server = self.clone();
+            tokio::spawn(async move {
+                server
+                    .allocation_table
+                    .register_client_sender(
+                        peer_addr,
+                        Arc::new(DtlsClientPacketSender { conn: conn.clone() }),
+                    )
+                    .await;
+
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match conn.recv(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(len) => {
+                            let data = Bytes::copy_from_slice(&buf[..len]);
+                            if let Some(response) =
+                                handle_dtls_message(data, peer_addr, &server).await
+                                && conn.send(&response).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("DTLS read error from {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+
+                server
+                    .allocation_table
+                    .unregister_client_sender(&peer_addr)
+                    .await;
+                let _ = conn.close().await;
+            });
+        }
+    }
+
     pub async fn run_udp(
         &self,
         addr: SocketAddr,
@@ -598,8 +738,7 @@ impl TurnServer {
             tokio::spawn(async move {
                 // Each worker processes only messages sent to its channel
                 while let Some((data, peer_addr)) = rx.recv().await {
-                    if let Some(response) =
-                        handle_udp_message(&socket, data, peer_addr, &server).await
+                    if let Some(response) = handle_udp_message(data, peer_addr, &server).await
                         && let Err(e) = socket.send_to(&response, &peer_addr).await
                     {
                         error!("UDP send error: {}", e);
@@ -655,7 +794,6 @@ async fn handle_tcp_message(
 }
 
 async fn handle_udp_message(
-    _socket: &Arc<UdpSocket>,
     data: Bytes,
     peer_addr: SocketAddr,
     server: &TurnServer,
@@ -766,11 +904,33 @@ async fn handle_udp_message(
     None
 }
 
+async fn handle_dtls_message(
+    data: Bytes,
+    peer_addr: SocketAddr,
+    server: &TurnServer,
+) -> Option<Bytes> {
+    handle_udp_message(data, peer_addr, server).await
+}
+
 async fn process_message(
     msg: Message,
     server: &TurnServer,
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
+    if msg.header.method == Method::Binding && !server.stun_enabled {
+        debug!(%client_addr, "dropping STUN Binding request because STUN is disabled");
+        return None;
+    }
+
+    if msg.header.method != Method::Binding && !server.turn_enabled {
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            "dropping TURN request because TURN is disabled"
+        );
+        return None;
+    }
+
     match msg.header.method {
         Method::Binding => handle_binding(msg, client_addr).await,
         Method::Allocate => handle_allocate(msg, server, client_addr).await,
@@ -1562,6 +1722,19 @@ mod tests {
         }
     }
 
+    fn build_binding_request(transaction_id: [u8; 12]) -> Message {
+        Message {
+            header: MessageHeader {
+                method: Method::Binding,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: 0x2112A442,
+                transaction_id,
+            },
+            attributes: vec![],
+        }
+    }
+
     fn build_authenticated_allocate_request(
         transaction_id: [u8; 12],
         username: &str,
@@ -1593,6 +1766,32 @@ mod tests {
         let server = TurnServer::new(Ipv4Addr::new(0, 0, 0, 0), "test".to_string());
         assert_eq!(server.relay_addr, Ipv4Addr::new(0, 0, 0, 0));
         assert_eq!(server.relay_bind_addr, Ipv4Addr::new(0, 0, 0, 0));
+        assert!(server.stun_enabled);
+        assert!(server.turn_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_stun_disabled_drops_binding_request() {
+        let mut server = TurnServer::new(Ipv4Addr::new(0, 0, 0, 0), "test".to_string());
+        server.set_protocol_enabled(false, true);
+        let client_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let msg = build_binding_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+        let response = process_message(msg, &server, client_addr).await;
+
+        assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_turn_disabled_drops_allocate_request() {
+        let mut server = TurnServer::new(Ipv4Addr::new(0, 0, 0, 0), "test".to_string());
+        server.set_protocol_enabled(true, false);
+        let client_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+        let response = process_message(msg, &server, client_addr).await;
+
+        assert!(response.is_none());
     }
 
     #[tokio::test]

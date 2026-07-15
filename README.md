@@ -36,9 +36,18 @@ docker run -p 3478:3478 -p 3478:3478/udp -p 8080:8080 docker.cnb.cool/miuda.ai/m
 #### Build from Source
 
 ```bash
+make zig-build
 docker build -t miuturn .
 docker run -p 3478:3478 -p 3478:3478/udp -p 8080:8080 miuturn
 ```
+
+For multi-platform images:
+
+```bash
+make docker-build IMAGE=miuturn:latest
+```
+
+`make zig-build` creates UPX-compressed `dist/miuturn-linux-amd64` and `dist/miuturn-linux-arm64` binaries using `cargo zigbuild`; install `zig`, `cargo-zigbuild`, and `upx` first.
 
 ## Configuration
 
@@ -54,6 +63,8 @@ end_port = 65535
 max_concurrent_allocations = 1000
 max_bandwidth_bytes_per_sec = 10485760
 max_allocation_duration_secs = 3600
+stun_enabled = true
+turn_enabled = true
 
 [[server.listening]]
 protocol = "udp"
@@ -62,6 +73,19 @@ address = "0.0.0.0:3478"
 [[server.listening]]
 protocol = "tcp"
 address = "0.0.0.0:3478"
+
+[[server.listening]]
+protocol = "tls"
+address = "0.0.0.0:5349"
+
+[[server.listening]]
+protocol = "dtls"
+address = "0.0.0.0:5349"
+
+[certificates]
+source = "local"
+cert_path = "/etc/letsencrypt/live/turn.example.com/fullchain.pem"
+key_path = "/etc/letsencrypt/live/turn.example.com/privkey.pem"
 
 [http]
 address = "0.0.0.0:8080"
@@ -103,6 +127,53 @@ priority = 1
 
 `external_ip` is the relay address advertised back to clients.
 `relay_bind_ip` is the local interface used to bind relay sockets. If omitted, it defaults to `0.0.0.0`. In NAT deployments, set `external_ip` to the public IP and keep `relay_bind_ip` as `0.0.0.0` (or a specific local interface IP if needed).
+Set `stun_enabled = false` to disable STUN Binding responses, or `turn_enabled = false` to run a STUN-only service without TURN allocations and relay operations.
+
+### TLS Certificates
+
+TURN over TLS is enabled by adding a `protocol = "tls"` listener, usually on port `5349`, plus a `[certificates]` section. TURN over DTLS uses `protocol = "dtls"` and the same certificate settings.
+
+Use local PEM files:
+
+```toml
+[certificates]
+source = "local"
+cert_path = "/etc/letsencrypt/live/turn.example.com/fullchain.pem"
+key_path = "/etc/letsencrypt/live/turn.example.com/privkey.pem"
+```
+
+Or let the server issue and cache a Let's Encrypt certificate with HTTP-01:
+
+```toml
+[certificates]
+source = "letsencrypt"
+environment = "staging" # or "production"
+domains = ["turn.example.com"]
+email = "admin@example.com"
+http01_address = "0.0.0.0:80"
+cache_dir = "./cert-cache"
+renew_before_days = 30
+```
+
+Cached account credentials, certificate chain, and private key are reused on restart. ACME is contacted only when the cached certificate is missing or within `renew_before_days` of expiry.
+
+Or subscribe a TLS certificate from an Envoy SDS/xDS control plane without proxying miuturn traffic:
+
+```toml
+[certificates]
+source = "sds"
+sds_address = "http://127.0.0.1:18000"
+sds_api = "ads" # "ads", "sds", "delta_ads", or "delta_sds"
+sds_resource_name = "turn-cert"
+sds_node_id = "" # empty or omitted uses HOSTNAME, then /etc/hostname
+sds_cluster = "turn"
+sds_timeout_secs = 10
+cache_dir = "/tmp/miuturn-cert-cache"
+# Only used to decide whether cached SDS certs are acceptable when SDS is unavailable.
+#renew_before_days = 30
+```
+
+SDS uses Envoy v3 protobufs generated with `tonic-build`. By default it opens SotW ADS `AggregatedDiscoveryService/StreamAggregatedResources`; set `sds_api = "sds"` for direct SotW SDS. For Delta xDS control planes, use `sds_api = "delta_ads"` or `sds_api = "delta_sds"`. `cache_dir` stores the last fetched SDS certificate for startup fallback; use a writable path or mounted volume in containers. The stream ACKs valid updates and reconnects after disconnects. TLS listeners use updated certificates for new handshakes without restarting. DTLS listeners cache updates, but the current DTLS stack reads certificates when the listener is created, so restart the DTLS listener/process to use a rotated certificate.
 
 ## Admin Console
 

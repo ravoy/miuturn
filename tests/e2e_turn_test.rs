@@ -3,12 +3,30 @@
 //! Tests the full TURN protocol with actual allocation, channel binding, and data relay.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
+use dtls::config::Config as DtlsConfig;
+use dtls::conn::DTLSConn;
+use dtls::crypto::Certificate as DtlsCertificate;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
+use webrtc_util::conn::Conn;
 
-use miuturn::TurnServer;
+use miuturn::{TurnServer, ensure_rustls_crypto_provider};
+
+fn raw_stun_binding_request() -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.push(0x00);
+    msg.push(0x01);
+    msg.push(0x00);
+    msg.push(0x00);
+    msg.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    msg.extend_from_slice(&[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+    ]);
+    msg
+}
 
 #[tokio::test]
 async fn test_e2e_stun_binding_auth_disabled() {
@@ -75,6 +93,67 @@ async fn test_e2e_stun_binding_auth_disabled() {
 
     // Clean up
     drop(server_handle);
+}
+
+#[tokio::test]
+async fn test_e2e_dtls_stun_binding_auth_disabled() {
+    ensure_rustls_crypto_provider();
+    let relay_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
+    let server = TurnServer::with_auth_disabled(relay_addr, "test".to_string());
+    let server_addr: SocketAddr = "127.0.0.1:3496".parse().unwrap();
+    let cert = DtlsCertificate::generate_self_signed(vec!["localhost".to_string()]).unwrap();
+
+    let srv = server.clone();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = srv
+            .run_dtls(
+                server_addr,
+                DtlsConfig {
+                    certificates: vec![cert],
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            eprintln!("DTLS server error: {}", e);
+        }
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    client_socket.connect(server_addr).await.unwrap();
+    let client_conn = DTLSConn::new(
+        client_socket,
+        DtlsConfig {
+            insecure_skip_verify: true,
+            ..Default::default()
+        },
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let msg = raw_stun_binding_request();
+    client_conn.send(&msg).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let len = tokio::time::timeout(Duration::from_secs(3), client_conn.recv(&mut buf))
+        .await
+        .expect("timeout waiting for DTLS STUN response")
+        .unwrap();
+
+    let resp_type = (buf[0] as u16) << 8 | (buf[1] as u16);
+    assert_eq!(
+        resp_type, 0x0101,
+        "Expected Binding Success (0x0101), got 0x{:04x}",
+        resp_type
+    );
+    assert!(len > 24, "Response too short for XOR-MAPPED-ADDRESS");
+
+    let _ = client_conn.close().await;
+    server_handle.abort();
 }
 
 #[tokio::test]

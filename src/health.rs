@@ -247,7 +247,10 @@ pub async fn create_admin_routes(
         )
         .route("/logout", post(logout_handler))
         .route("/metrics", get(prometheus_metrics_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), admin_acl_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_acl_middleware,
+        ));
 
     let app = public_routes
         .merge(admin_routes)
@@ -795,9 +798,15 @@ async fn ice_servers_handler(
             "tcp" => {
                 urls.push(format!("turn:{}:{}?transport=tcp", state.external_ip, port));
             }
-            "tls" | "dtls" => {
+            "tls" => {
                 urls.push(format!(
                     "turns:{}:{}?transport=tcp",
+                    state.external_ip, port
+                ));
+            }
+            "dtls" => {
+                urls.push(format!(
+                    "turns:{}:{}?transport=udp",
                     state.external_ip, port
                 ));
             }

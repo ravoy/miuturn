@@ -8,6 +8,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub http: Option<HttpConfig>,
+    #[serde(default)]
+    pub certificates: Option<CertificateConfig>,
     pub auth: AuthConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -31,6 +33,10 @@ pub struct ServerConfig {
     pub stats_dump_skip_if_no_change: bool,
     #[serde(default = "ServerConfig::default_server_name")]
     pub server_name: String,
+    #[serde(default = "ServerConfig::default_stun_enabled")]
+    pub stun_enabled: bool,
+    #[serde(default = "ServerConfig::default_turn_enabled")]
+    pub turn_enabled: bool,
 }
 
 impl ServerConfig {
@@ -44,6 +50,14 @@ impl ServerConfig {
 
     fn default_server_name() -> String {
         format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    }
+
+    fn default_stun_enabled() -> bool {
+        true
+    }
+
+    fn default_turn_enabled() -> bool {
+        true
     }
 }
 
@@ -96,6 +110,41 @@ impl Default for HttpConfig {
             trust_proxy: Self::default_trust_proxy(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct CertificateConfig {
+    /// "local", "letsencrypt", or "sds"
+    pub source: String,
+    /// PEM certificate chain path for source="local"
+    pub cert_path: Option<String>,
+    /// PEM private key path for source="local"
+    pub key_path: Option<String>,
+    /// Domains/SANs for source="letsencrypt"
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Optional account contact email for Let's Encrypt
+    pub email: Option<String>,
+    /// "production" or "staging" for source="letsencrypt"
+    pub environment: Option<String>,
+    /// Cache directory for ACME account, certificate chain, and private key
+    pub cache_dir: Option<String>,
+    /// Address for temporary HTTP-01 challenge server, usually "0.0.0.0:80"
+    pub http01_address: Option<String>,
+    /// Renew cached certificate when it expires within this many days
+    pub renew_before_days: Option<u64>,
+    /// SDS/xDS gRPC endpoint for source="sds", e.g. "http://127.0.0.1:18000"
+    pub sds_address: Option<String>,
+    /// xDS stream API for source="sds": "ads", "sds", "delta_ads", or "delta_sds"
+    pub sds_api: Option<String>,
+    /// SDS resource name to subscribe for source="sds"
+    pub sds_resource_name: Option<String>,
+    /// Envoy Node id sent in SDS requests; empty or omitted uses the host name
+    pub sds_node_id: Option<String>,
+    /// Optional Envoy Node cluster sent in the SDS DiscoveryRequest
+    pub sds_cluster: Option<String>,
+    /// Timeout in seconds while waiting for the first SDS response
+    pub sds_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -188,8 +237,11 @@ impl Default for Config {
                 stats_dump_interval_secs: 30,
                 stats_dump_skip_if_no_change: true,
                 server_name: ServerConfig::default_server_name(),
+                stun_enabled: true,
+                turn_enabled: true,
             },
             http: None,
+            certificates: None,
             log: LogConfig::default(),
             auth: AuthConfig {
                 users: vec![],
@@ -223,6 +275,8 @@ mod tests {
         assert_eq!(config.server.start_port, 49152);
         assert_eq!(config.server.end_port, 65535);
         assert!(config.server.max_concurrent_allocations.is_none());
+        assert!(config.server.stun_enabled);
+        assert!(config.server.turn_enabled);
     }
 
     #[test]
@@ -254,6 +308,8 @@ start_port = 49152
 end_port = 65535
 max_concurrent_allocations = 100
 max_allocation_duration_secs = 600
+stun_enabled = false
+turn_enabled = true
 
 [[server.listening]]
 protocol = "udp"
@@ -284,6 +340,8 @@ priority = 0
         assert_eq!(config.server.realm, "test-realm");
         assert_eq!(config.server.external_ip, "192.168.1.1");
         assert_eq!(config.server.relay_bind_ip.as_deref(), Some("0.0.0.0"));
+        assert!(!config.server.stun_enabled);
+        assert!(config.server.turn_enabled);
         assert_eq!(config.http.as_ref().unwrap().turn_rest_enabled, Some(true));
         assert_eq!(
             config.http.as_ref().unwrap().turn_rest_secret,
@@ -304,6 +362,76 @@ priority = 0
         };
         let addr = config.addr();
         assert_eq!(addr.port(), 3478);
+    }
+
+    #[test]
+    fn test_certificate_config_letsencrypt() {
+        let toml_content = r#"
+[server]
+realm = "test-realm"
+external_ip = "192.168.1.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "tls"
+address = "0.0.0.0:5349"
+
+[certificates]
+source = "letsencrypt"
+environment = "staging"
+domains = ["turn.example.com"]
+email = "admin@example.com"
+http01_address = "0.0.0.0:80"
+cache_dir = "./cert-cache"
+renew_before_days = 30
+
+[auth]
+users = []
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let certs = config.certificates.unwrap();
+        assert_eq!(certs.source, "letsencrypt");
+        assert_eq!(certs.environment.as_deref(), Some("staging"));
+        assert_eq!(certs.domains, vec!["turn.example.com".to_string()]);
+        assert_eq!(certs.renew_before_days, Some(30));
+    }
+
+    #[test]
+    fn test_certificate_config_sds() {
+        let toml_content = r#"
+[server]
+realm = "test-realm"
+external_ip = "192.168.1.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "dtls"
+address = "0.0.0.0:5349"
+
+[certificates]
+source = "sds"
+sds_address = "http://127.0.0.1:18000"
+sds_api = "ads"
+sds_resource_name = "turn-cert"
+sds_node_id = "miuturn"
+sds_cluster = "turn"
+sds_timeout_secs = 5
+cache_dir = "./cert-cache"
+
+[auth]
+users = []
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let certs = config.certificates.unwrap();
+        assert_eq!(certs.source, "sds");
+        assert_eq!(certs.sds_address.as_deref(), Some("http://127.0.0.1:18000"));
+        assert_eq!(certs.sds_api.as_deref(), Some("ads"));
+        assert_eq!(certs.sds_resource_name.as_deref(), Some("turn-cert"));
+        assert_eq!(certs.sds_node_id.as_deref(), Some("miuturn"));
+        assert_eq!(certs.sds_cluster.as_deref(), Some("turn"));
+        assert_eq!(certs.sds_timeout_secs, Some(5));
     }
 
     #[test]

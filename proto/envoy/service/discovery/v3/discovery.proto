@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package envoy.service.discovery.v3;
+
+import "envoy/config/core/v3/base.proto";
+import "google/protobuf/any.proto";
+
+message DiscoveryRequest {
+  string version_info = 1;
+  envoy.config.core.v3.Node node = 2;
+  repeated string resource_names = 3;
+  string type_url = 4;
+  string response_nonce = 5;
+}
+
+message DiscoveryResponse {
+  string version_info = 1;
+  repeated google.protobuf.Any resources = 2;
+  bool canary = 3;
+  string type_url = 4;
+  string nonce = 5;
+}
+
+message DeltaDiscoveryRequest {
+  envoy.config.core.v3.Node node = 1;
+  string type_url = 2;
+  repeated string resource_names_subscribe = 3;
+  repeated string resource_names_unsubscribe = 4;
+  map<string, string> initial_resource_versions = 5;
+  string response_nonce = 6;
+}
+
+message DeltaDiscoveryResponse {
+  string system_version_info = 1;
+  repeated Resource resources = 2;
+  string type_url = 4;
+  string nonce = 5;
+  repeated string removed_resources = 6;
+}
+
+message Resource {
+  string version = 1;
+  google.protobuf.Any resource = 2;
+  string name = 3;
+  repeated string aliases = 4;
+}
+
+service AggregatedDiscoveryService {
+  rpc StreamAggregatedResources(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+  rpc DeltaAggregatedResources(stream DeltaDiscoveryRequest) returns (stream DeltaDiscoveryResponse);
+}

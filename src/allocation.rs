@@ -1,4 +1,5 @@
 use crate::errors::Error;
+use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -34,8 +35,82 @@ fn port_rand() -> u64 {
     })
 }
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock as TokioRwLock, mpsc};
 use tracing::{debug, trace, warn};
+
+#[async_trait]
+pub trait ClientPacketSender: Send + Sync {
+    async fn send_to_client(&self, data: &[u8], client_addr: &SocketAddr)
+    -> std::io::Result<usize>;
+}
+
+pub struct UdpClientPacketSender {
+    socket: Arc<UdpSocket>,
+}
+
+impl UdpClientPacketSender {
+    pub fn new(socket: Arc<UdpSocket>) -> Self {
+        Self { socket }
+    }
+}
+
+#[async_trait]
+impl ClientPacketSender for UdpClientPacketSender {
+    async fn send_to_client(
+        &self,
+        data: &[u8],
+        client_addr: &SocketAddr,
+    ) -> std::io::Result<usize> {
+        self.socket.send_to(data, client_addr).await
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ClientTransportRegistry {
+    default_sender: Arc<RwLock<Option<Arc<dyn ClientPacketSender>>>>,
+    client_senders: Arc<TokioRwLock<HashMap<SocketAddr, Arc<dyn ClientPacketSender>>>>,
+}
+
+impl ClientTransportRegistry {
+    pub async fn send_to_client(
+        &self,
+        data: &[u8],
+        client_addr: &SocketAddr,
+    ) -> std::io::Result<usize> {
+        if let Some(sender) = self.client_senders.read().await.get(client_addr).cloned() {
+            return sender.send_to_client(data, client_addr).await;
+        }
+
+        let default_sender = { self.default_sender.read().clone() };
+        if let Some(sender) = default_sender {
+            return sender.send_to_client(data, client_addr).await;
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "no client packet sender registered",
+        ))
+    }
+
+    pub async fn register_client(
+        &self,
+        client_addr: SocketAddr,
+        sender: Arc<dyn ClientPacketSender>,
+    ) {
+        self.client_senders
+            .write()
+            .await
+            .insert(client_addr, sender);
+    }
+
+    pub async fn unregister_client(&self, client_addr: &SocketAddr) {
+        self.client_senders.write().await.remove(client_addr);
+    }
+
+    fn set_default_sender(&self, sender: Arc<dyn ClientPacketSender>) {
+        *self.default_sender.write() = Some(sender);
+    }
+}
 
 /// Message types for allocation task communication
 #[derive(Debug)]
@@ -345,6 +420,7 @@ pub struct AllocationTable {
     _max_bandwidth_bytes_per_sec: Option<usize>,
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
     main_socket: RwLock<Option<std::sync::Arc<tokio::net::UdpSocket>>>,
+    client_transports: ClientTransportRegistry,
 }
 
 #[derive(Debug)]
@@ -444,6 +520,7 @@ impl AllocationTable {
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
             bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
             main_socket: RwLock::new(None),
+            client_transports: ClientTransportRegistry::default(),
         }
     }
 
@@ -492,11 +569,30 @@ impl AllocationTable {
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
             bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
             main_socket: RwLock::new(None),
+            client_transports: ClientTransportRegistry::default(),
         }
     }
 
     pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
         *self.main_socket.write() = Some(socket);
+        self.client_transports
+            .set_default_sender(Arc::new(UdpClientPacketSender::new(
+                self.main_socket.read().as_ref().unwrap().clone(),
+            )));
+    }
+
+    pub async fn register_client_sender(
+        &self,
+        client_addr: SocketAddr,
+        sender: Arc<dyn ClientPacketSender>,
+    ) {
+        self.client_transports
+            .register_client(client_addr, sender)
+            .await;
+    }
+
+    pub async fn unregister_client_sender(&self, client_addr: &SocketAddr) {
+        self.client_transports.unregister_client(client_addr).await;
     }
 
     pub fn stats(&self) -> Arc<ServerStats> {
@@ -601,14 +697,13 @@ impl AllocationTable {
         getrandom(&mut id);
 
         // Spawn the per-allocation task
-        let main_socket = self
-            .main_socket
-            .read()
-            .clone()
-            .unwrap_or_else(|| relay_socket.clone());
+        if self.main_socket.read().is_none() {
+            self.client_transports
+                .set_default_sender(Arc::new(UdpClientPacketSender::new(relay_socket.clone())));
+        }
         let relay = spawn_allocation_task(
             relay_socket.clone(),
-            main_socket, // Use main socket for sending Data Indication
+            self.client_transports.clone(),
             client_addr,
             relay_bind_addr,
             relayed_addr,
@@ -1025,7 +1120,7 @@ fn normalize_peer_addr_for_client(
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
-    main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication / ChannelData to client
+    client_transports: ClientTransportRegistry,
     client_addr: SocketAddr,
     relay_bind_addr: SocketAddr,
     relayed_addr: SocketAddr,
@@ -1035,7 +1130,7 @@ async fn spawn_allocation_task(
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
     let socket_clone = socket.clone();
-    let main_socket_clone = main_socket.clone();
+    let client_transports_clone = client_transports.clone();
 
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -1072,7 +1167,7 @@ async fn spawn_allocation_task(
                                 channel_data[3] = (data_len & 0xFF) as u8;
                                 channel_data[4..].copy_from_slice(&buf[..len]);
 
-                                if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
+                                if let Err(e) = client_transports_clone.send_to_client(&channel_data, &client_addr).await {
                                     debug!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1085,7 +1180,7 @@ async fn spawn_allocation_task(
                             } else {
                                 // Send as Data Indication
                                 let indication = build_data_indication(effective_peer, &buf[..len]);
-                                if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
+                                if let Err(e) = client_transports_clone.send_to_client(&indication, &client_addr).await {
                                     debug!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1124,8 +1219,8 @@ async fn spawn_allocation_task(
                             }
                         }
                         AllocationMessage::ChannelData { data, channel_num: _ } => {
-                            // Forward channel data via main socket (not relay socket)
-                            if let Err(e) = main_socket_clone.send_to(&data, &client_addr).await {
+                            // Forward channel data via the client transport (UDP or DTLS).
+                            if let Err(e) = client_transports_clone.send_to_client(&data, &client_addr).await {
                                 debug!(
                                     %client_addr,
                                     payload_len = data.len(),

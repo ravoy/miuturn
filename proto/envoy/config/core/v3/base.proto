@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package envoy.config.core.v3;
+
+message Node {
+  string id = 1;
+  string cluster = 2;
+}
+
+message DataSource {
+  oneof specifier {
+    string filename = 1;
+    bytes inline_bytes = 2;
+    string inline_string = 3;
+  }
+}

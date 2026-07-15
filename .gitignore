@@ -1,4 +1,5 @@
 /target
+/dist
 miuturn.toml
 Cargo.lock
 static/turn_test.html

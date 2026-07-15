@@ -7,6 +7,7 @@ pub mod health;
 pub mod message;
 pub mod metrics;
 pub mod oauth;
+pub mod sds;
 pub mod server;
 pub mod short_term;
 pub mod tls;
@@ -28,4 +29,7 @@ pub use metrics::{Metrics, MetricsSnapshot};
 pub use oauth::{OAuthConfig, OAuthUserInfo, OAuthValidator, extract_bearer_token};
 pub use server::TurnServer;
 pub use short_term::ShortTermCredentialManager;
-pub use tls::{TlsConfig, default_test_tls_config};
+pub use tls::{
+    TlsConfig, default_test_tls_config, ensure_rustls_crypto_provider, load_certificate_config,
+    load_dtls_certificate_config,
+};

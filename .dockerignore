@@ -1,0 +1,7 @@
+.git
+target
+dist/bin
+dist/*
+!dist/miuturn-linux-*
+*.log
+.DS_Store

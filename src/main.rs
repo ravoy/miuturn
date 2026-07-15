@@ -45,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Port range: {}-{}",
         config.server.start_port, config.server.end_port
     );
+    println!("STUN enabled: {}", config.server.stun_enabled);
+    println!("TURN enabled: {}", config.server.turn_enabled);
 
     let relay_addr: std::net::Ipv4Addr = config
         .server
@@ -77,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     server.set_stats_dump_interval(config.server.stats_dump_interval_secs);
     server.set_stats_dump_skip_if_no_change(config.server.stats_dump_skip_if_no_change);
     server.set_server_name(config.server.server_name.clone());
+    server.set_protocol_enabled(config.server.stun_enabled, config.server.turn_enabled);
 
     info!(
         external_ip = %relay_addr,
@@ -84,6 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stats_dump_interval = config.server.stats_dump_interval_secs,
         stats_dump_skip_if_no_change = config.server.stats_dump_skip_if_no_change,
         server_name = %config.server.server_name,
+        stun_enabled = config.server.stun_enabled,
+        turn_enabled = config.server.turn_enabled,
         "configured relay addressing"
     );
 
@@ -93,6 +98,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     server.set_auth_manager(auth_manager.clone());
 
     let server = server; // remove mut
+
+    let has_tls_listener = config
+        .server
+        .listening
+        .iter()
+        .any(|listener| listener.protocol == "tls");
+    let has_dtls_listener = config
+        .server
+        .listening
+        .iter()
+        .any(|listener| listener.protocol == "dtls");
+
+    let cert_config = if has_tls_listener || has_dtls_listener {
+        let cert_config = config
+            .certificates
+            .as_ref()
+            .ok_or("a [certificates] section is required when TLS or DTLS is configured")?;
+        Some(cert_config)
+    } else {
+        None
+    };
+
+    let tls_config = if has_tls_listener {
+        let cert_config = cert_config.expect("certificate config was checked above");
+        Some(miuturn::load_certificate_config(cert_config).await?)
+    } else {
+        None
+    };
+    let dtls_config = if has_dtls_listener {
+        let cert_config = cert_config.expect("certificate config was checked above");
+        Some(miuturn::load_dtls_certificate_config(cert_config).await?)
+    } else {
+        None
+    };
 
     for user_config in &config.auth.users {
         let user = User {
@@ -152,6 +191,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tokio::spawn(async move {
                     if let Err(e) = srv.run_tcp(addr).await {
                         tracing::error!("TCP server error: {}", e);
+                    }
+                });
+            }
+            "tls" => {
+                let Some(tls_config) = tls_config.clone() else {
+                    tracing::error!(
+                        "TLS listener {} skipped because certificate config is unavailable",
+                        addr
+                    );
+                    continue;
+                };
+                let srv = server.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = srv.run_tls(addr, tls_config).await {
+                        tracing::error!("TLS server error: {}", e);
+                    }
+                });
+            }
+            "dtls" => {
+                let Some(dtls_config) = dtls_config.clone() else {
+                    tracing::error!(
+                        "DTLS listener {} skipped because certificate config is unavailable",
+                        addr
+                    );
+                    continue;
+                };
+                let srv = server.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = srv.run_dtls(addr, dtls_config).await {
+                        tracing::error!("DTLS server error: {}", e);
                     }
                 });
             }

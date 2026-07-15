@@ -14,6 +14,9 @@ stats_dump_interval_secs = 30
 stats_dump_skip_if_no_change = true
 # Server name for SOFTWARE attribute in TURN responses (default: miuturn/0.1.2)
 server_name = "miuturn/0.1.2"
+# Enable STUN Binding responses and TURN relay operations independently.
+stun_enabled = true
+turn_enabled = true
 
 [[server.listening]]
 protocol = "udp"
@@ -22,6 +25,45 @@ address = "0.0.0.0:3478"
 #[[server.listening]]
 #protocol = "tcp"
 #address = "0.0.0.0:3478"
+
+#[[server.listening]]
+#protocol = "tls"
+#address = "0.0.0.0:5349"
+
+#[[server.listening]]
+#protocol = "dtls"
+#address = "0.0.0.0:5349"
+
+#[certificates]
+# Local PEM certificate chain and private key:
+#source = "local"
+#cert_path = "/etc/letsencrypt/live/turn.example.com/fullchain.pem"
+#key_path = "/etc/letsencrypt/live/turn.example.com/privkey.pem"
+
+#[certificates]
+# Let's Encrypt HTTP-01 automation. Use "staging" while testing, then "production".
+#source = "letsencrypt"
+#environment = "staging"
+#domains = ["turn.example.com"]
+#email = "admin@example.com"
+#http01_address = "0.0.0.0:80"
+#cache_dir = "./cert-cache"
+#renew_before_days = 30
+
+#[certificates]
+# Envoy SDS/xDS certificate subscription. Envoy does not proxy miuturn traffic;
+# miuturn only connects to the SDS control plane to fetch the TLS secret.
+# TLS listeners hot-reload new SDS certificates for new handshakes; DTLS needs restart.
+#source = "sds"
+#sds_address = "http://127.0.0.1:18000"
+#sds_api = "delta_ads" # "ads", "sds", "delta_ads", or "delta_sds"
+#sds_resource_name = "turn-cert"
+#sds_node_id = "" # empty or omitted uses HOSTNAME, then /etc/hostname
+#sds_cluster = "turn"
+#sds_timeout_secs = 10
+#cache_dir = "/tmp/miuturn-cert-cache"
+# Only used to decide whether cached SDS certs are acceptable when SDS is unavailable.
+#renew_before_days = 30
 
 #[http]
 #address = "0.0.0.0:8080"
