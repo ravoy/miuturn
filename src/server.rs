@@ -98,6 +98,32 @@ fn is_tls_handshake_eof(error: &io::Error) -> bool {
     ) || error.to_string().to_ascii_lowercase().contains("eof")
 }
 
+fn extract_stream_frame(buf: &mut BytesMut) -> Option<Bytes> {
+    if buf.len() < 4 {
+        return None;
+    }
+
+    let first_word = u16::from_be_bytes([buf[0], buf[1]]);
+    let payload_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let is_channel_data = (0x4000..=0x7FFF).contains(&first_word);
+
+    let frame_len = if is_channel_data {
+        let padded_len = (payload_len + 3) & !3;
+        4 + padded_len
+    } else {
+        if buf.len() < 20 {
+            return None;
+        }
+        20 + payload_len
+    };
+
+    if buf.len() < frame_len {
+        return None;
+    }
+
+    Some(buf.split_to(frame_len).freeze())
+}
+
 #[derive(Clone)]
 pub struct TurnServer {
     pub allocation_table: Arc<AllocationTable>,
@@ -589,15 +615,13 @@ impl TurnServer {
                     match socket.read_buf(&mut buf).await {
                         Ok(0) => break,
                         Ok(_n) => {
-                            let data = buf.split().freeze();
-                            if let Some(response) =
-                                handle_tcp_message(&data, &server, peer_addr).await
-                                && socket.write_all(&response).await.is_err()
-                            {
-                                break;
-                            }
-                            if buf.is_empty() {
-                                break;
+                            while let Some(data) = extract_stream_frame(&mut buf) {
+                                if let Some(response) =
+                                    handle_tcp_message(&data, &server, peer_addr).await
+                                    && socket.write_all(&response).await.is_err()
+                                {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {
@@ -649,15 +673,13 @@ impl TurnServer {
                     match socket.read_buf(&mut buf).await {
                         Ok(0) => break,
                         Ok(_n) => {
-                            let data = buf.split().freeze();
-                            if let Some(response) =
-                                handle_tcp_message(&data, &server, peer_addr).await
-                                && socket.write_all(&response).await.is_err()
-                            {
-                                break;
-                            }
-                            if buf.is_empty() {
-                                break;
+                            while let Some(data) = extract_stream_frame(&mut buf) {
+                                if let Some(response) =
+                                    handle_tcp_message(&data, &server, peer_addr).await
+                                    && socket.write_all(&response).await.is_err()
+                                {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1818,6 +1840,36 @@ mod tests {
 
         let invalid_data = io::Error::new(io::ErrorKind::InvalidData, "invalid certificate");
         assert!(!is_tls_handshake_eof(&invalid_data));
+    }
+
+    #[test]
+    fn test_extract_stream_frame_keeps_partial_stun_message_buffered() {
+        let encoded = build_binding_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).encode();
+        let mut buf = BytesMut::from(&encoded[..encoded.len() - 1]);
+
+        assert!(extract_stream_frame(&mut buf).is_none());
+        assert_eq!(buf.len(), encoded.len() - 1);
+    }
+
+    #[test]
+    fn test_extract_stream_frame_reads_back_to_back_stun_messages() {
+        let first = build_binding_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).encode();
+        let second = build_allocate_request([11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]).encode();
+        let mut buf = BytesMut::from(&[first.as_ref(), second.as_ref()].concat()[..]);
+
+        assert_eq!(extract_stream_frame(&mut buf).unwrap(), first);
+        assert_eq!(extract_stream_frame(&mut buf).unwrap(), second);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_extract_stream_frame_consumes_channel_data_padding() {
+        let mut buf = BytesMut::from(&[0x40, 0x00, 0x00, 0x03, 1, 2, 3, 0][..]);
+
+        let frame = extract_stream_frame(&mut buf).unwrap();
+
+        assert_eq!(frame.as_ref(), &[0x40, 0x00, 0x00, 0x03, 1, 2, 3, 0]);
+        assert!(buf.is_empty());
     }
 
     #[tokio::test]
