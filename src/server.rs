@@ -80,6 +80,24 @@ fn format_messages_and_rate(total: u64, delta: u64, interval_secs: u64) -> (Stri
     (total_str, rate_str)
 }
 
+fn enabled_protocol_label(stun_enabled: bool, turn_enabled: bool) -> &'static str {
+    match (stun_enabled, turn_enabled) {
+        (true, true) => "STUN/TURN",
+        (true, false) => "STUN",
+        (false, true) => "TURN",
+        (false, false) => "disabled STUN/TURN",
+    }
+}
+
+fn is_tls_handshake_eof(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    ) || error.to_string().to_ascii_lowercase().contains("eof")
+}
+
 #[derive(Clone)]
 pub struct TurnServer {
     pub allocation_table: Arc<AllocationTable>,
@@ -131,6 +149,10 @@ impl TurnServer {
     pub fn set_protocol_enabled(&mut self, stun_enabled: bool, turn_enabled: bool) {
         self.stun_enabled = stun_enabled;
         self.turn_enabled = turn_enabled;
+    }
+
+    pub fn protocol_label(&self) -> &'static str {
+        enabled_protocol_label(self.stun_enabled, self.turn_enabled)
     }
 
     pub fn with_password(relay_addr: Ipv4Addr, realm: String, password: String) -> Self {
@@ -548,7 +570,7 @@ impl TurnServer {
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(addr).await?;
-        info!("TURN TCP server listening on {}", addr);
+        info!("{} TCP server listening on {}", self.protocol_label(), addr);
         loop {
             let (mut socket, peer_addr) = listener.accept().await?;
             let server = self.clone();
@@ -595,7 +617,7 @@ impl TurnServer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(addr).await?;
         let acceptor = TlsAcceptor::from(tls_config);
-        info!("TURN TLS server listening on {}", addr);
+        info!("{} TLS server listening on {}", self.protocol_label(), addr);
 
         loop {
             let (socket, peer_addr) = listener.accept().await?;
@@ -605,7 +627,11 @@ impl TurnServer {
                 let mut socket = match acceptor.accept(socket).await {
                     Ok(socket) => socket,
                     Err(e) => {
-                        error!("TLS handshake error from {}: {}", peer_addr, e);
+                        if is_tls_handshake_eof(&e) {
+                            debug!("TLS handshake closed by {}: {}", peer_addr, e);
+                        } else {
+                            error!("TLS handshake error from {}: {}", peer_addr, e);
+                        }
                         return;
                     }
                 };
@@ -651,7 +677,11 @@ impl TurnServer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ensure_rustls_crypto_provider();
         let listener = dtls::listener::listen(addr, dtls_config).await?;
-        info!("TURN DTLS server listening on {}", addr);
+        info!(
+            "{} DTLS server listening on {}",
+            self.protocol_label(),
+            addr
+        );
 
         loop {
             let (conn, peer_addr) = listener.accept().await?;
@@ -708,7 +738,7 @@ impl TurnServer {
         );
 
         let socket = Arc::new(UdpSocket::bind(addr).await?);
-        info!("TURN UDP server listening on {}", addr);
+        info!("{} UDP server listening on {}", self.protocol_label(), addr);
 
         // Set main socket for Data Indication NAT traversal
         self.allocation_table.set_main_socket(socket.clone());
@@ -1768,6 +1798,26 @@ mod tests {
         assert_eq!(server.relay_bind_addr, Ipv4Addr::new(0, 0, 0, 0));
         assert!(server.stun_enabled);
         assert!(server.turn_enabled);
+    }
+
+    #[test]
+    fn test_enabled_protocol_label() {
+        assert_eq!(enabled_protocol_label(true, true), "STUN/TURN");
+        assert_eq!(enabled_protocol_label(true, false), "STUN");
+        assert_eq!(enabled_protocol_label(false, true), "TURN");
+        assert_eq!(enabled_protocol_label(false, false), "disabled STUN/TURN");
+    }
+
+    #[test]
+    fn test_tls_handshake_eof_is_not_reported_as_hard_error() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof");
+        assert!(is_tls_handshake_eof(&eof));
+
+        let reset = io::Error::new(io::ErrorKind::ConnectionReset, "connection reset");
+        assert!(is_tls_handshake_eof(&reset));
+
+        let invalid_data = io::Error::new(io::ErrorKind::InvalidData, "invalid certificate");
+        assert!(!is_tls_handshake_eof(&invalid_data));
     }
 
     #[tokio::test]

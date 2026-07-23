@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
-    println!("Starting miuturn TURN server");
+    println!("Starting miuturn server");
     println!("Realm: {}", config.server.realm);
     println!("External IP: {}", config.server.external_ip);
     if let Some(ref relay_bind_ip) = config.server.relay_bind_ip {
