@@ -33,6 +33,9 @@ address = "0.0.0.0:3478"
 #[[server.listening]]
 #protocol = "dtls"
 #address = "0.0.0.0:5349"
+# Note: DTLS currently requires an ECDSA P-256 or Ed25519 certificate key.
+# RSA certificates work for TLS/TCP; DTLS logs the mismatch and falls back to
+# an in-process self-signed ECDSA certificate.
 
 #[certificates]
 # Local PEM certificate chain and private key:

@@ -10,7 +10,7 @@ use axum::{
     routing::get,
 };
 use dtls::config::Config as DtlsConfig;
-use dtls::crypto::Certificate as DtlsCertificate;
+use dtls::crypto::{Certificate as DtlsCertificate, CryptoPrivateKeyKind};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
     NewAccount, NewOrder, OrderStatus, RetryPolicy,
@@ -217,11 +217,48 @@ pub async fn load_dtls_certificate_config(
     config: &CertificateConfig,
 ) -> Result<DtlsConfig, Box<dyn std::error::Error + Send + Sync>> {
     ensure_rustls_crypto_provider();
+
+    match load_dtls_certificate_config_inner(config).await {
+        Ok(config) => Ok(config),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "failed to load configured DTLS certificate"
+            );
+            tracing::warn!(
+                "using a generated self-signed ECDSA P-256 certificate for DTLS; \
+                 TLS/TCP still uses the configured certificate"
+            );
+            default_self_signed_dtls_config(config)
+        }
+    }
+}
+
+async fn load_dtls_certificate_config_inner(
+    config: &CertificateConfig,
+) -> Result<DtlsConfig, Box<dyn std::error::Error + Send + Sync>> {
     let (cert_pem, key_pem) = load_certificate_pem(config).await?;
+    let certificate = dtls_certificate_from_pem(&cert_pem, &key_pem)?;
+
     if config.source == "sds" {
         start_sds_cache_watcher(config.clone())?;
     }
-    let certificate = dtls_certificate_from_pem(&cert_pem, &key_pem)?;
+
+    Ok(DtlsConfig {
+        certificates: vec![certificate],
+        ..Default::default()
+    })
+}
+
+fn default_self_signed_dtls_config(
+    config: &CertificateConfig,
+) -> Result<DtlsConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let domains = if config.domains.is_empty() {
+        vec!["localhost".to_string()]
+    } else {
+        config.domains.clone()
+    };
+    let certificate = DtlsCertificate::generate_self_signed(domains)?;
 
     Ok(DtlsConfig {
         certificates: vec![certificate],
@@ -329,7 +366,20 @@ fn dtls_certificate_from_pem(
 ) -> Result<DtlsCertificate, Box<dyn std::error::Error + Send + Sync>> {
     let key_pem = normalize_dtls_private_key_pem(key_pem.as_bytes())?;
     let dtls_pem = format!("{}\n{}", key_pem.trim(), cert_pem.trim());
-    Ok(DtlsCertificate::from_pem(&dtls_pem)?)
+    let certificate = DtlsCertificate::from_pem(&dtls_pem)?;
+
+    if matches!(
+        &certificate.private_key.kind,
+        CryptoPrivateKeyKind::Rsa256(_)
+    ) {
+        return Err(
+            "DTLS does not support RSA private keys with the current dtls crate; \
+             use ECDSA P-256 or Ed25519, or allow the self-signed DTLS fallback"
+                .into(),
+        );
+    }
+
+    Ok(certificate)
 }
 
 fn normalize_dtls_private_key_pem(
@@ -826,6 +876,30 @@ mod tests {
         assert_eq!(cloned.cert_der, config.cert_der);
         assert_eq!(cloned.key_der, config.key_der);
         assert_eq!(cloned.cert_chain_der, config.cert_chain_der);
+    }
+
+    #[tokio::test]
+    async fn test_dtls_certificate_config_falls_back_to_self_signed() {
+        let config = CertificateConfig {
+            source: "local".to_string(),
+            cert_path: Some("/path/that/does/not/exist/cert.pem".to_string()),
+            key_path: Some("/path/that/does/not/exist/key.pem".to_string()),
+            domains: vec!["localhost".to_string()],
+            email: None,
+            environment: None,
+            cache_dir: None,
+            http01_address: None,
+            renew_before_days: None,
+            sds_address: None,
+            sds_api: None,
+            sds_resource_name: None,
+            sds_node_id: None,
+            sds_cluster: None,
+            sds_timeout_secs: None,
+        };
+
+        let dtls_config = load_dtls_certificate_config(&config).await.unwrap();
+        assert_eq!(dtls_config.certificates.len(), 1);
     }
 
     #[test]

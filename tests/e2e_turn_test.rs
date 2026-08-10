@@ -9,11 +9,65 @@ use std::time::Duration;
 use dtls::config::Config as DtlsConfig;
 use dtls::conn::DTLSConn;
 use dtls::crypto::Certificate as DtlsCertificate;
-use tokio::net::UdpSocket;
-use tokio::time::sleep;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::{sleep, timeout};
+use tokio_rustls::TlsConnector;
 use webrtc_util::conn::Conn;
 
-use miuturn::{TurnServer, ensure_rustls_crypto_provider};
+use miuturn::{TurnServer, default_test_tls_config, ensure_rustls_crypto_provider};
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
+}
+
+fn pick_free_tcp_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp tcp listener");
+    listener.local_addr().expect("temp tcp local addr").port()
+}
 
 fn raw_stun_binding_request() -> Vec<u8> {
     let mut msg = Vec::new();
@@ -92,6 +146,55 @@ async fn test_e2e_stun_binding_auth_disabled() {
     assert!(len > 24, "Response too short for XOR-MAPPED-ADDRESS");
 
     // Clean up
+    drop(server_handle);
+}
+
+#[tokio::test]
+async fn test_e2e_tls_stun_binding_auth_disabled() {
+    ensure_rustls_crypto_provider();
+    let relay_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
+    let server = TurnServer::with_auth_disabled(relay_addr, "test".to_string());
+    let server_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], pick_free_tcp_port()));
+    let tls_config = default_test_tls_config()
+        .unwrap()
+        .into_server_config()
+        .unwrap();
+
+    let srv = server.clone();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = srv.run_tls(server_addr, tls_config).await {
+            eprintln!("TLS server error: {}", e);
+        }
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let tcp = TcpStream::connect(server_addr).await.unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+    let msg = raw_stun_binding_request();
+    tls.write_all(&msg).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let len = timeout(Duration::from_secs(3), tls.read(&mut buf))
+        .await
+        .expect("timeout waiting for TLS STUN response")
+        .expect("read TLS STUN response");
+
+    let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        resp_type, 0x0101,
+        "Expected Binding Success (0x0101), got 0x{:04x}",
+        resp_type
+    );
+    assert!(len > 24, "Response too short for XOR-MAPPED-ADDRESS");
+
     drop(server_handle);
 }
 

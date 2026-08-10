@@ -13,9 +13,9 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
 use webrtc_util::conn::{Conn, Listener};
@@ -33,6 +33,26 @@ impl ClientPacketSender for DtlsClientPacketSender {
             .send(data)
             .await
             .map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+struct StreamClientPacketSender<W> {
+    writer: Arc<TokioMutex<W>>,
+}
+
+impl<W> StreamClientPacketSender<W> {
+    fn new(writer: Arc<TokioMutex<W>>) -> Self {
+        Self { writer }
+    }
+}
+
+#[async_trait::async_trait]
+impl<W> ClientPacketSender for StreamClientPacketSender<W>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    async fn send_to_client(&self, data: &[u8], _client_addr: &SocketAddr) -> io::Result<usize> {
+        write_locked_stream_frame(&self.writer, data).await
     }
 }
 
@@ -122,6 +142,50 @@ fn extract_stream_frame(buf: &mut BytesMut) -> Option<Bytes> {
     }
 
     Some(buf.split_to(frame_len).freeze())
+}
+
+fn missing_stream_channel_padding(data: &[u8]) -> usize {
+    if data.len() < 4 {
+        return 0;
+    }
+
+    let channel_num = u16::from_be_bytes([data[0], data[1]]);
+    if !(0x4000..=0x7FFF).contains(&channel_num) {
+        return 0;
+    }
+
+    let payload_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let unpadded_frame_len = 4 + payload_len;
+    if data.len() < unpadded_frame_len {
+        return 0;
+    }
+
+    let padded_payload_len = (payload_len + 3) & !3;
+    let padded_frame_len = 4 + padded_payload_len;
+    padded_frame_len.saturating_sub(data.len())
+}
+
+async fn write_stream_frame<W>(writer: &mut W, data: &[u8]) -> io::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(data).await?;
+
+    let padding_len = missing_stream_channel_padding(data);
+    if padding_len > 0 {
+        const ZERO_PADDING: [u8; 3] = [0; 3];
+        writer.write_all(&ZERO_PADDING[..padding_len]).await?;
+    }
+
+    Ok(data.len() + padding_len)
+}
+
+async fn write_locked_stream_frame<W>(writer: &Arc<TokioMutex<W>>, data: &[u8]) -> io::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = writer.lock().await;
+    write_stream_frame(&mut *writer, data).await
 }
 
 #[derive(Clone)]
@@ -598,9 +662,19 @@ impl TurnServer {
         let listener = TcpListener::bind(addr).await?;
         info!("{} TCP server listening on {}", self.protocol_label(), addr);
         loop {
-            let (mut socket, peer_addr) = listener.accept().await?;
+            let (socket, peer_addr) = listener.accept().await?;
             let server = self.clone();
             tokio::spawn(async move {
+                let (mut reader, writer) = socket.into_split();
+                let writer = Arc::new(TokioMutex::new(writer));
+                server
+                    .allocation_table
+                    .register_client_sender(
+                        peer_addr,
+                        Arc::new(StreamClientPacketSender::new(writer.clone())),
+                    )
+                    .await;
+
                 const MAX_TCP_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
                 let mut buf = BytesMut::with_capacity(65536);
                 loop {
@@ -612,14 +686,18 @@ impl TurnServer {
                         break;
                     }
 
-                    match socket.read_buf(&mut buf).await {
+                    match reader.read_buf(&mut buf).await {
                         Ok(0) => break,
                         Ok(_n) => {
                             while let Some(data) = extract_stream_frame(&mut buf) {
                                 if let Some(response) =
                                     handle_tcp_message(&data, &server, peer_addr).await
-                                    && socket.write_all(&response).await.is_err()
+                                    && write_locked_stream_frame(&writer, &response).await.is_err()
                                 {
+                                    server
+                                        .allocation_table
+                                        .unregister_client_sender(&peer_addr)
+                                        .await;
                                     return;
                                 }
                             }
@@ -630,6 +708,11 @@ impl TurnServer {
                         }
                     }
                 }
+
+                server
+                    .allocation_table
+                    .unregister_client_sender(&peer_addr)
+                    .await;
             });
         }
     }
@@ -648,7 +731,7 @@ impl TurnServer {
             let acceptor = acceptor.clone();
             let server = self.clone();
             tokio::spawn(async move {
-                let mut socket = match acceptor.accept(socket).await {
+                let socket = match acceptor.accept(socket).await {
                     Ok(socket) => socket,
                     Err(e) => {
                         if is_tls_handshake_eof(&e) {
@@ -659,6 +742,15 @@ impl TurnServer {
                         return;
                     }
                 };
+                let (mut reader, writer) = tokio::io::split(socket);
+                let writer = Arc::new(TokioMutex::new(writer));
+                server
+                    .allocation_table
+                    .register_client_sender(
+                        peer_addr,
+                        Arc::new(StreamClientPacketSender::new(writer.clone())),
+                    )
+                    .await;
 
                 const MAX_TLS_BUFFER_SIZE: usize = 10 * 1024 * 1024;
                 let mut buf = BytesMut::with_capacity(65536);
@@ -670,14 +762,18 @@ impl TurnServer {
                         break;
                     }
 
-                    match socket.read_buf(&mut buf).await {
+                    match reader.read_buf(&mut buf).await {
                         Ok(0) => break,
                         Ok(_n) => {
                             while let Some(data) = extract_stream_frame(&mut buf) {
                                 if let Some(response) =
                                     handle_tcp_message(&data, &server, peer_addr).await
-                                    && socket.write_all(&response).await.is_err()
+                                    && write_locked_stream_frame(&writer, &response).await.is_err()
                                 {
+                                    server
+                                        .allocation_table
+                                        .unregister_client_sender(&peer_addr)
+                                        .await;
                                     return;
                                 }
                             }
@@ -688,6 +784,11 @@ impl TurnServer {
                         }
                     }
                 }
+
+                server
+                    .allocation_table
+                    .unregister_client_sender(&peer_addr)
+                    .await;
             });
         }
     }
@@ -836,6 +937,11 @@ async fn handle_tcp_message(
     server: &TurnServer,
     peer_addr: SocketAddr,
 ) -> Option<Bytes> {
+    if is_channel_data_frame(data) {
+        handle_channel_data(data, peer_addr, server).await;
+        return None;
+    }
+
     if let Some(msg) = Message::parse(&data[..]) {
         let response = process_message(msg, server, peer_addr).await;
         if let Some(r) = response {
@@ -853,42 +959,8 @@ async fn handle_udp_message(
     if data.len() < 4 {
         return None;
     }
-    let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
-    if (0x4000..=0x7FFF).contains(&channel_num) {
-        let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-        let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
-        let payload = data.slice(4..payload_end);
-
-        let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
-        let has_allocation = allocation.is_some();
-        let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-        let channel_binding = if let Some(relayed_addr) = relayed_addr {
-            server
-                .channel_table
-                .read()
-                .await
-                .get_by_channel(relayed_addr, channel_num)
-        } else {
-            None
-        };
-
-        if let Some(channel) = channel_binding {
-            // Get the relay socket from the allocation (must release lock before await)
-            let relay_socket = allocation.as_ref().and_then(|alloc| {
-                let a = alloc.read();
-                a.relay.as_ref().map(|r| r.socket.clone())
-            });
-
-            if let Some(relay_sock) = relay_socket {
-                let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
-            }
-        } else {
-            tracing::debug!(
-                "ChannelData dropped: has_alloc={} binding={}",
-                has_allocation,
-                channel_binding.is_some()
-            );
-        }
+    if is_channel_data_frame(&data) {
+        handle_channel_data(&data, peer_addr, server).await;
         return None;
     }
 
@@ -954,6 +1026,56 @@ async fn handle_udp_message(
     }
 
     None
+}
+
+fn is_channel_data_frame(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+
+    let channel_num = u16::from_be_bytes([data[0], data[1]]);
+    (0x4000..=0x7FFF).contains(&channel_num)
+}
+
+async fn handle_channel_data(data: &Bytes, peer_addr: SocketAddr, server: &TurnServer) {
+    if data.len() < 4 {
+        return;
+    }
+
+    let channel_num = u16::from_be_bytes([data[0], data[1]]);
+    let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
+    let payload = data.slice(4..payload_end);
+
+    let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
+    let has_allocation = allocation.is_some();
+    let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+    let channel_binding = if let Some(relayed_addr) = relayed_addr {
+        server
+            .channel_table
+            .read()
+            .await
+            .get_by_channel(relayed_addr, channel_num)
+    } else {
+        None
+    };
+
+    if let Some(channel) = channel_binding {
+        let relay_socket = allocation.as_ref().and_then(|alloc| {
+            let a = alloc.read();
+            a.relay.as_ref().map(|r| r.socket.clone())
+        });
+
+        if let Some(relay_sock) = relay_socket {
+            let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
+        }
+    } else {
+        tracing::debug!(
+            "ChannelData dropped: has_alloc={} binding={}",
+            has_allocation,
+            channel_binding.is_some()
+        );
+    }
 }
 
 async fn handle_dtls_message(
@@ -1870,6 +1992,34 @@ mod tests {
 
         assert_eq!(frame.as_ref(), &[0x40, 0x00, 0x00, 0x03, 1, 2, 3, 0]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_missing_stream_channel_padding() {
+        assert_eq!(
+            missing_stream_channel_padding(&[0x40, 0x00, 0x00, 0x03, 1, 2, 3]),
+            1
+        );
+        assert_eq!(
+            missing_stream_channel_padding(&[0x40, 0x00, 0x00, 0x03, 1, 2, 3, 0]),
+            0
+        );
+        assert_eq!(missing_stream_channel_padding(&[0x00, 0x01, 0x00, 0x00]), 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_stream_frame_pads_channel_data() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let written = write_stream_frame(&mut server, &[0x40, 0x00, 0x00, 0x03, 1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(written, 8);
+
+        let mut out = [0u8; 8];
+        client.read_exact(&mut out).await.unwrap();
+        assert_eq!(out, [0x40, 0x00, 0x00, 0x03, 1, 2, 3, 0]);
     }
 
     #[tokio::test]
